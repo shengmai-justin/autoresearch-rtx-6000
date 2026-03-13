@@ -114,6 +114,10 @@ def _get_gpu_peak_flops(gpu_name):
         ("3080", 119.5e12),
         ("3060", 51.0e12),
         ("3070", 81.1e12),
+        ("pro 6000 blackwell server", 480.0e12),
+        ("pro 6000 blackwell workstation", 503.8e12),
+        ("pro 6000 blackwell max-q", 438.9e12),
+        ("pro 6000", 503.8e12),
     )
     for key, flops in lookup:
         if key in name:
