@@ -9,13 +9,13 @@ No YAML, no CLI args for now — just change the values and run.
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"  # HuggingFace model ID
 MODEL_DIR = "./models/DeepSeek-R1-0528-Qwen3-8B"       # local path after download
 VLLM_PORT = 8000                                        # vLLM server port
-VLLM_GPU = 0                                            # GPU index for LLM
+VLLM_GPU = 6                                            # GPU index for LLM
 
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
 REPO_PATH = ".."                                        # path to the autoresearch repo (parent dir)
-TRAIN_GPU = 1                                           # GPU index for train.py
+TRAIN_GPU = 7                                           # GPU index for train.py
 EVAL_TIME_BUDGET = 300                                  # seconds per train.py run (300 = full, 60 = proxy)
 
 # ---------------------------------------------------------------------------

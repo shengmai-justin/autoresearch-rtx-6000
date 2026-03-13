@@ -129,31 +129,28 @@ def main():
     history = []
     best_bpb = config.BASELINE_BPB  # start from baseline
 
-    print(f"Starting RL training: algo={args.algo}, steps={args.steps}, "
-          f"episodes/step={args.episodes}, keep_if_improved={args.keep_if_improved}")
-    print(f"LLM on GPU {config.VLLM_GPU}, train.py on GPU {config.TRAIN_GPU}")
+    if args.algo == "none":
+        total_episodes = args.steps * args.episodes  # treat total as flat count
+        print(f"Starting ablation (no RL): {total_episodes} episodes, "
+              f"keep_if_improved={args.keep_if_improved}")
+        print(f"LLM on GPU {config.VLLM_GPU}, train.py on GPU {config.TRAIN_GPU}")
 
-    for step in range(start_step, start_step + args.steps):
-        t0 = time.time()
-
-        # Collect episodes
-        trajectories = []
-        for ep in range(args.episodes):
-            print(f"  Step {step}, episode {ep}/{args.episodes}...", flush=True)
+        all_trajectories = []
+        for ep in range(total_episodes):
+            print(f"  Episode {ep + 1}/{total_episodes}...", flush=True)
+            t0 = time.time()
             traj = run_episode(
                 generate_fn, config.REPO_PATH, history,
                 best_bpb=best_bpb,
                 keep_if_improved=args.keep_if_improved,
             )
-            trajectories.append(traj)
+            all_trajectories.append(traj)
 
-            # Track best val_bpb
             if not traj.crashed and traj.val_bpb > 0:
                 if traj.val_bpb < best_bpb:
                     best_bpb = traj.val_bpb
                     print(f"    New best val_bpb: {best_bpb:.6f}")
 
-            # Update history for future prompts
             history.append({
                 "val_bpb": traj.val_bpb,
                 "crashed": traj.crashed,
@@ -161,29 +158,69 @@ def main():
                 "description": traj.response[:200] if traj.response else "",
             })
 
-            # Save trajectory
             traj.save(os.path.join(
                 config.TRAJECTORY_DIR,
-                f"step{step:04d}_ep{ep:02d}.json",
+                f"ep{ep:04d}.json",
             ))
 
-        # RL update (or no-op for ablation)
-        metrics = algo.update(trajectories)
-        metrics["step_time"] = time.time() - t0
-        metrics["best_bpb"] = best_bpb
+            # Log each episode individually
+            metrics = algo.update([traj])
+            metrics["episode_time"] = time.time() - t0
+            metrics["best_bpb"] = best_bpb
+            log_step(ep, metrics, [traj], log_file)
 
-        # Regenerate generate_fn with updated model weights
-        if args.algo != "none":
+    else:
+        print(f"Starting RL training: algo={args.algo}, steps={args.steps}, "
+              f"episodes/step={args.episodes}, keep_if_improved={args.keep_if_improved}")
+        print(f"LLM on GPU {config.VLLM_GPU}, train.py on GPU {config.TRAIN_GPU}")
+
+        for step in range(start_step, start_step + args.steps):
+            t0 = time.time()
+
+            # Collect episodes
+            trajectories = []
+            for ep in range(args.episodes):
+                print(f"  Step {step}, episode {ep}/{args.episodes}...", flush=True)
+                traj = run_episode(
+                    generate_fn, config.REPO_PATH, history,
+                    best_bpb=best_bpb,
+                    keep_if_improved=args.keep_if_improved,
+                )
+                trajectories.append(traj)
+
+                if not traj.crashed and traj.val_bpb > 0:
+                    if traj.val_bpb < best_bpb:
+                        best_bpb = traj.val_bpb
+                        print(f"    New best val_bpb: {best_bpb:.6f}")
+
+                history.append({
+                    "val_bpb": traj.val_bpb,
+                    "crashed": traj.crashed,
+                    "kept": traj.metadata.get("kept", False),
+                    "description": traj.response[:200] if traj.response else "",
+                })
+
+                traj.save(os.path.join(
+                    config.TRAJECTORY_DIR,
+                    f"step{step:04d}_ep{ep:02d}.json",
+                ))
+
+            # RL update
+            metrics = algo.update(trajectories)
+            metrics["step_time"] = time.time() - t0
+            metrics["best_bpb"] = best_bpb
+
+            # Regenerate generate_fn with updated model weights
             generate_fn = make_generate_fn(model, tokenizer)
 
-        # Log
-        log_step(step, metrics, trajectories, log_file)
+            # Log
+            log_step(step, metrics, trajectories, log_file)
 
-        # Checkpoint
-        if (step + 1) % config.CHECKPOINT_INTERVAL == 0:
-            ckpt_path = os.path.join(config.CHECKPOINT_DIR, f"step_{step + 1}.pt")
-            algo.save_checkpoint(ckpt_path)
-            print(f"  Saved checkpoint: {ckpt_path}")
+            # Checkpoint
+            if (step + 1) % config.CHECKPOINT_INTERVAL == 0:
+                ckpt_path = os.path.join(config.CHECKPOINT_DIR, f"step_{step + 1}.pt")
+                algo.save_checkpoint(ckpt_path)
+                print(f"  Saved checkpoint: {ckpt_path}")
 
     print(f"Training complete. Best val_bpb: {best_bpb:.6f}")
 
