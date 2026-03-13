@@ -38,7 +38,7 @@ def setup_model():
 def make_generate_fn(model, tokenizer):
     """Create the generate function used by env.run_episode."""
     def generate(prompt: str) -> str:
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=131072)
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=131072 - config.MAX_NEW_TOKENS)
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
         with torch.no_grad():
             outputs = model.generate(

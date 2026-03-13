@@ -21,7 +21,7 @@ EVAL_TIME_BUDGET = 300                                  # seconds per train.py r
 # ---------------------------------------------------------------------------
 # Episode
 # ---------------------------------------------------------------------------
-MAX_NEW_TOKENS = 4096           # max tokens the model can generate per response
+MAX_NEW_TOKENS = 8192           # max tokens the model can generate per response
 TEMPERATURE = 1.0               # sampling temperature during episode collection
 BASELINE_BPB = 1.0              # initial val_bpb (updated after first baseline run)
 CRASH_PENALTY = -1.0            # reward for crashed runs

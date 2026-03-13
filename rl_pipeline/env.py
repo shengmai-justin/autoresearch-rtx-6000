@@ -63,10 +63,14 @@ Rules:
 - Only modify train.py. Do not touch prepare.py.
 - The code must run without crashing.
 - Simpler changes that improve val_bpb are preferred over complex ones.
+- Keep your reasoning brief (2-3 sentences max), then output the edit immediately.
 """
 
 EDIT_FORMAT = """\
-Output your reasoning first, then your edit in this exact format:
+IMPORTANT: Be brief. State your idea in 1-2 sentences, then IMMEDIATELY output your edit.
+Do NOT write long analysis. Go straight to the edit.
+
+Use this EXACT format:
 
 <<<<<<< SEARCH
 (exact lines from the current file to find)
@@ -75,6 +79,15 @@ Output your reasoning first, then your edit in this exact format:
 >>>>>>> REPLACE
 
 You may include multiple SEARCH/REPLACE blocks if needed.
+
+Example:
+Idea: Increase learning rate for faster convergence.
+
+<<<<<<< SEARCH
+learning_rate = 0.001
+=======
+learning_rate = 0.003
+>>>>>>> REPLACE
 """
 
 
