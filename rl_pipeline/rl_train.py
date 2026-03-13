@@ -11,6 +11,7 @@ Usage (on cloud server):
 import argparse
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -38,7 +39,14 @@ def setup_model():
 def make_generate_fn(model, tokenizer):
     """Create the generate function used by env.run_episode."""
     def generate(prompt: str) -> str:
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=131072 - config.MAX_NEW_TOKENS)
+        messages = [{"role": "user", "content": prompt}]
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True,
+        )
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=config.MAX_CONTEXT - config.MAX_NEW_TOKENS)
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
         with torch.no_grad():
             outputs = model.generate(
@@ -48,9 +56,14 @@ def make_generate_fn(model, tokenizer):
                 do_sample=True,
                 top_p=0.95,
             )
-        # Decode only the new tokens
+        # Decode only the new tokens — keep <think>/<\/think> tags so
+        # strip_thinking() in env.py can remove the reasoning section
         new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-        return tokenizer.decode(new_tokens, skip_special_tokens=True)
+        raw = tokenizer.decode(new_tokens, skip_special_tokens=False)
+        # Strip chat-template markers (<|im_end|>, <|endoftext|>, etc.)
+        # but preserve <think>/<\/think> (no pipe chars, so regex skips them)
+        raw = re.sub(r"<\|[^>]+\|>", "", raw)
+        return raw.strip()
     return generate
 
 

@@ -53,45 +53,43 @@ class Trajectory:
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
-You are an ML researcher modifying a GPT training script to achieve the lowest \
-possible val_bpb (validation bits per byte). Lower is better.
-
-You can change anything in train.py: model architecture, optimizer, hyperparameters, \
-batch size, model size, etc. The training runs for a fixed 5-minute time budget.
+You are an ML researcher modifying a GPT training script to minimize val_bpb \
+(validation bits per byte). Lower is better. Training runs for a fixed 5-minute \
+time budget on a single GPU.
 
 Rules:
-- Only modify train.py. Do not touch prepare.py.
-- The code must run without crashing.
-- Simpler changes that improve val_bpb are preferred over complex ones.
-- Keep your reasoning brief (2-3 sentences max), then output the edit immediately.
+- Only modify train.py (not prepare.py).
+- The code must run without crashing (common failures: OOM, shape mismatch, missing imports).
+- Think carefully, then output the edit.
 """
 
 EDIT_FORMAT = """\
-IMPORTANT: Be brief. State your idea in 1-2 sentences, then IMMEDIATELY output your edit.
-Do NOT write long analysis. Go straight to the edit.
-
-Use this EXACT format:
+Output exactly ONE edit in this format. Copy lines from the file EXACTLY as they \
+appear, including indentation. Do NOT add or remove leading spaces.
 
 <<<<<<< SEARCH
-(exact lines from the current file to find)
+(exact lines copied from the current file)
 =======
 (replacement lines)
 >>>>>>> REPLACE
 
-You may include multiple SEARCH/REPLACE blocks if needed.
-
-Example:
-Idea: Increase learning rate for faster convergence.
+Example (note: indentation must match the file exactly):
 
 <<<<<<< SEARCH
-learning_rate = 0.001
+DEPTH = 8
+ASPECT_RATIO = 64
 =======
-learning_rate = 0.003
+DEPTH = 12
+ASPECT_RATIO = 64
 >>>>>>> REPLACE
 """
 
 
-def build_prompt(repo_path: str, history: list[dict] | None = None) -> str:
+def build_prompt(
+    repo_path: str,
+    history: list[dict] | None = None,
+    best_bpb: float | None = None,
+) -> str:
     """Build the prompt from current train.py + experiment history."""
     train_py = Path(repo_path) / "train.py"
     code = train_py.read_text()
@@ -101,11 +99,18 @@ def build_prompt(repo_path: str, history: list[dict] | None = None) -> str:
         "## Current train.py\n```python\n" + code + "\n```\n",
     ]
 
+    if best_bpb is not None:
+        parts.append(f"Current best val_bpb: {best_bpb:.6f}. Beat this.\n")
+
     if history:
         parts.append("## Experiment history (recent first)")
         for exp in history[-10:]:  # last 10 experiments
-            status = "CRASH" if exp.get("crashed") else f"val_bpb={exp.get('val_bpb', '?')}"
-            parts.append(f"- {exp.get('description', 'unknown')}: {status}")
+            desc = exp.get("description", "unknown change")
+            if exp.get("crashed"):
+                error = exp.get("error", "")
+                parts.append(f"- {desc}: CRASHED ({error})")
+            else:
+                parts.append(f"- {desc}: val_bpb={exp.get('val_bpb', '?')}")
         parts.append("")
 
     parts.append("## Your task")
@@ -118,20 +123,75 @@ def build_prompt(repo_path: str, history: list[dict] | None = None) -> str:
 # Response parsing — extract SEARCH/REPLACE blocks and apply them
 # ---------------------------------------------------------------------------
 
+def strip_thinking(response: str) -> str:
+    """Remove <think>...</think> blocks from the response."""
+    return re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+
+
 def parse_edits(response: str) -> list[tuple[str, str]]:
-    """Extract (search, replace) pairs from the model response."""
-    pattern = r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE"
+    """Extract (search, replace) pairs from the model response, deduplicated."""
+    response = strip_thinking(response)
+    # Strip markdown code fences (```python, ```, etc.)
+    response = re.sub(r"```\w*\r?\n?", "", response)
+    # Normalize \r\n → \n
+    response = response.replace("\r\n", "\n")
+    # Flexible marker matching:
+    #   - 3-7 angle brackets/equals signs
+    #   - optional trailing whitespace on marker lines
+    #   - replacement section can be empty (for deletions)
+    pattern = (
+        r"<{3,7}\s*SEARCH[ \t]*\n"
+        r"(.*?)\n"
+        r"={3,7}[ \t]*\n"
+        r"(.*?)"
+        r">{3,7}\s*REPLACE"
+    )
     matches = re.findall(pattern, response, re.DOTALL)
-    return matches
+    # Deduplicate and strip trailing newline from replacement
+    seen = set()
+    unique = []
+    for search, replace in matches:
+        replace = replace.rstrip("\n")
+        key = (search, replace)
+        if key not in seen:
+            seen.add(key)
+            unique.append(key)
+    return unique
+
+
+def _strip_common_leading_whitespace(text: str) -> str:
+    """Remove common leading whitespace from all lines (like textwrap.dedent)."""
+    lines = text.splitlines()
+    non_empty = [l for l in lines if l.strip()]
+    if not non_empty:
+        return text
+    min_indent = min(len(l) - len(l.lstrip()) for l in non_empty)
+    if min_indent == 0:
+        return text
+    return "\n".join(l[min_indent:] if len(l) >= min_indent else l for l in lines)
 
 
 def apply_edits(file_path: str, edits: list[tuple[str, str]]) -> bool:
-    """Apply SEARCH/REPLACE edits to a file. Returns True if all edits applied."""
+    """Apply SEARCH/REPLACE edits to a file.
+
+    Tries exact match first.  If that fails, strips common leading whitespace
+    from the SEARCH/REPLACE block and retries (handles model adding extra
+    indentation in its response).
+
+    Returns True if all edits applied.
+    """
     content = Path(file_path).read_text()
     for search, replace in edits:
-        if search not in content:
-            return False
-        content = content.replace(search, replace, 1)
+        if search in content:
+            content = content.replace(search, replace, 1)
+        else:
+            # Retry with leading whitespace stripped
+            stripped_search = _strip_common_leading_whitespace(search)
+            stripped_replace = _strip_common_leading_whitespace(replace)
+            if stripped_search in content:
+                content = content.replace(stripped_search, stripped_replace, 1)
+            else:
+                return False
     Path(file_path).write_text(content)
     return True
 
@@ -242,7 +302,7 @@ def run_episode(
     t0 = time.time()
 
     # 1. Build prompt
-    prompt = build_prompt(repo_path, history)
+    prompt = build_prompt(repo_path, history, best_bpb)
 
     # 2. Generate response
     response = generate_fn(prompt)

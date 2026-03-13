@@ -34,23 +34,31 @@ class GRPO:
     def _compute_log_probs(self, prompt, response, require_grad=False):
         """Compute mean log probability of response tokens given prompt.
 
-        Uses joint tokenization to avoid boundary merge issues:
-        tokenize prompt alone to get prompt_len, then tokenize the full
-        string (prompt+response) so merge artifacts only affect the boundary
-        and prompt_len is derived from the same tokenizer call.
+        Applies the same chat template used during generation so token
+        sequences match.  Uses joint tokenization to avoid boundary merge
+        issues: tokenize prompt alone to get prompt_len, then tokenize the
+        full string (prompt+response) so merge artifacts only affect the
+        boundary and prompt_len is derived from the same tokenizer call.
         """
-        # Tokenize prompt separately to find where response starts
+        # Apply the same chat template used during generation
+        messages = [{"role": "user", "content": prompt}]
+        templated_prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=True,
+        )
+
+        # Tokenize templated prompt separately to find where response starts
         prompt_enc = self.tokenizer(
-            prompt, return_tensors="pt", truncation=True,
-            max_length=config.MAX_NEW_TOKENS * 2,
+            templated_prompt, return_tensors="pt", truncation=True,
+            max_length=config.MAX_CONTEXT,
             add_special_tokens=True,
         )
         prompt_len = prompt_enc["input_ids"].shape[1]
 
-        # Tokenize full text (prompt + response) jointly
+        # Tokenize full text (templated prompt + response) jointly
         full_enc = self.tokenizer(
-            prompt + response, return_tensors="pt", truncation=True,
-            max_length=config.MAX_NEW_TOKENS * 2,
+            templated_prompt + response, return_tensors="pt", truncation=True,
+            max_length=config.MAX_CONTEXT,
             add_special_tokens=True,
         )
         input_ids = full_enc["input_ids"].to(self.model.device)

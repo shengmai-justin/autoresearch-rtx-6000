@@ -8,12 +8,12 @@ set -e
 #   bash setup_server.sh
 #
 # Options:
-#   bash setup_server.sh --model deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+#   bash setup_server.sh --model Qwen/Qwen3.5-9B
 #   bash setup_server.sh --skip-model   # skip model download
 #   bash setup_server.sh --skip-data    # skip data preparation
 # ============================================================
 
-MODEL_ID="${MODEL_ID:-deepseek-ai/DeepSeek-R1-0528-Qwen3-8B}"
+MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-9B}"
 MODEL_DIR="./models/$(basename $MODEL_ID)"
 REPO_PATH=".."   # parent dir is autoresearch-rtx-6000
 
