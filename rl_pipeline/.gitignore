@@ -1,0 +1,7 @@
+PROGRESS.md
+checkpoints/
+trajectories/
+models/
+training_log.jsonl
+eval_*.jsonl
+__pycache__/
