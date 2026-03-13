@@ -21,7 +21,7 @@ EVAL_TIME_BUDGET = 300                                  # seconds per train.py r
 # ---------------------------------------------------------------------------
 # Episode
 # ---------------------------------------------------------------------------
-MAX_NEW_TOKENS = 16384          # max tokens the model can generate per response
+MAX_NEW_TOKENS = 32768          # max tokens the model can generate per response
                                 # (reasoning model — <think> tokens count against this budget)
 MAX_CONTEXT = 262144            # Qwen3.5-9B native context length
 TEMPERATURE = 1.0               # sampling temperature during episode collection
