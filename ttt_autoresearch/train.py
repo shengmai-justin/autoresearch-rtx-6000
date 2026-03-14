@@ -360,16 +360,20 @@ def main():
 
                 ratio = torch.exp(new_lp - old_lp)
                 all_ratios.append(ratio.detach().cpu())
-                loss = -(ratio * adv.to(model.device)).mean()
 
+                # KL folded into advantage (paper Step 6):
+                # A(a;s) = w_β(a) - 1 - λ·log(π_θ/π_base)
+                shaped_adv = adv.to(model.device)
                 if args.kl_coef > 0:
                     base_lp = compute_base_logprobs(
                         model, tokenizer, full_ids, plen,
                         temperature=args.temperature,
                     )
-                    kl = (new_lp - base_lp).mean()
-                    all_kls.append(kl.item())
-                    loss = loss + args.kl_coef * kl
+                    kl_per_token = new_lp - base_lp
+                    all_kls.append(kl_per_token.mean().item())
+                    shaped_adv = shaped_adv - args.kl_coef * kl_per_token
+
+                loss = -(ratio * shaped_adv).mean()
 
                 loss.backward()
                 total_loss += loss.item() * len(new_lp)
