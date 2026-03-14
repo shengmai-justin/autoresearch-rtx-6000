@@ -184,7 +184,7 @@ def main():
 
         # -- Generate rollouts -----------------------------------------------
         for pi, parent in enumerate(parents):
-            print(f"\n  Parent {pi}: val_bpb={-parent.value:.6f}" if parent.value else f"\n  Parent {pi}: no value")
+            print(f"\n  Parent {pi}: val_bpb={-parent.value:.6f}" if parent.value is not None else f"\n  Parent {pi}: no value")
             prompt = build_prompt(parent)
             episodes = []
 

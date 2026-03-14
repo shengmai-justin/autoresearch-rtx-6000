@@ -197,8 +197,8 @@ def evaluate_episode(
             "output": "No edits found in response",
         }
 
-    # Read original code
-    original_code = Path(train_py_path).read_text()
+    # Write parent's code to train.py first — edits target parent code, not committed code
+    Path(train_py_path).write_text(parent.code)
 
     # Apply edits
     applied = apply_edits(train_py_path, edits)

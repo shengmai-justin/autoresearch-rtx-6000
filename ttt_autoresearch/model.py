@@ -87,18 +87,18 @@ def generate_with_logprobs(
     full_ids = outputs.sequences[0]  # [prompt_len + new_tokens]
     new_ids = full_ids[prompt_len:]
 
-    # Extract logprobs from logits
-    # outputs.logits is a tuple of (num_new_tokens,) tensors, each [1, vocab]
+    # Extract per-token logprobs from logits, then discard logits to free GPU memory
     logprobs_list = []
     for t, logits_t in enumerate(outputs.logits):
         if temperature > 0:
             log_probs = torch.log_softmax(logits_t[0] / temperature, dim=-1)
         else:
             log_probs = torch.log_softmax(logits_t[0], dim=-1)
-        token_id = new_ids[t]
-        logprobs_list.append(log_probs[token_id].item())
+        logprobs_list.append(log_probs[new_ids[t]].item())
+    del outputs  # free GPU logit tensors
 
     logprobs = torch.tensor(logprobs_list, dtype=torch.float32)
+    full_ids = full_ids.cpu()
     text = tokenizer.decode(new_ids, skip_special_tokens=True)
 
     return text, full_ids, logprobs, prompt_len
