@@ -150,12 +150,30 @@ def compute_entropic_advantages(rewards: list[float]) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def _append_jsonl(path: str, obj: dict):
+    with open(path, "a") as f:
+        f.write(json.dumps(obj) + "\n")
+
+
+def _log_eval_result(result: dict, eval_time: float):
+    if result["success"]:
+        print(f"    eval: val_bpb={result['val_bpb']:.6f} ({eval_time:.1f}s)")
+    else:
+        print(f"    eval: FAILED: {result['output'][:100]} ({eval_time:.1f}s)")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
     os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(os.path.join(LOG_DIR, "rollouts"), exist_ok=True)
     code_dir = os.path.abspath(os.path.dirname(__file__))
+    rollout_log = os.path.join(LOG_DIR, "rollouts.jsonl")
 
     print("=" * 60)
     print("TTT-Discover Autoresearch")
@@ -221,6 +239,8 @@ def main():
 
         parents = [sampler.sample_state() for _ in range(BATCH_SIZE)]
         all_episodes: list[tuple[State, list[dict]]] = []
+        step_gen_times = []
+        step_eval_times = []
 
         for pi, parent in enumerate(parents):
             print(f"\n  Parent {pi}: val_bpb={-parent.value:.6f}" if parent.value is not None else f"\n  Parent {pi}: no value")
@@ -239,7 +259,9 @@ def main():
                     temperature=TEMPERATURE,
                 )
                 gen_time = time.time() - gen_start
-                print(f"generated ({len(full_ids)-prompt_len} tokens, {gen_time:.1f}s)", flush=True)
+                num_new_tokens = len(full_ids) - prompt_len
+                step_gen_times.append(gen_time)
+                print(f"generated ({num_new_tokens} tokens, {gen_time:.1f}s)", flush=True)
 
                 worker = workers[g % len(workers)]
                 ref = worker.evaluate.remote(parent_dict, text, step)
@@ -247,25 +269,32 @@ def main():
                     "full_ids": full_ids,
                     "old_logprobs": old_logprobs,
                     "prompt_len": prompt_len,
+                    "response_text": text,
+                    "num_new_tokens": num_new_tokens,
+                    "gen_time": gen_time,
                     "eval_ref": ref,
                     "eval_start": time.time(),
                 })
-                # Sequential mode: block until this eval finishes
                 if not OVERLAP_GEN_EVAL:
                     ray.get(ref)
 
             # Collect all eval results
             episodes = []
-            for r in rollouts:
+            for g, r in enumerate(rollouts):
                 result = ray.get(r["eval_ref"])
                 eval_time = time.time() - r["eval_start"]
-                # Deserialize child state
+                step_eval_times.append(eval_time)
                 if result.get("child_state") is not None:
                     result["child_state"] = State.from_dict(result["child_state"])
                 _log_eval_result(result, eval_time)
                 if result["success"] and result["val_bpb"] < best_bpb:
                     best_bpb = result["val_bpb"]
                     print(f"    *** NEW BEST: {best_bpb:.6f} ***")
+                    # Save best code immediately
+                    child = result["child_state"]
+                    if child is not None:
+                        Path(os.path.join(LOG_DIR, "best_train.py")).write_text(child.code)
+
                 episodes.append({
                     "full_ids": r["full_ids"],
                     "old_logprobs": r["old_logprobs"],
@@ -273,6 +302,27 @@ def main():
                     "result": result,
                     "reward": result["reward"],
                 })
+
+                # Log rollout to JSONL
+                _append_jsonl(rollout_log, {
+                    "step": step,
+                    "parent_id": pi,
+                    "rollout_id": g,
+                    "success": result["success"],
+                    "val_bpb": result.get("val_bpb"),
+                    "reward": result["reward"],
+                    "num_tokens": r["num_new_tokens"],
+                    "gen_time_s": round(r["gen_time"], 1),
+                    "eval_time_s": round(eval_time, 1),
+                    "error": result["output"][:200] if not result["success"] else None,
+                })
+
+                # Save full response for debugging
+                rollout_path = os.path.join(
+                    LOG_DIR, "rollouts", f"step{step:04d}_p{pi}_r{g}.txt"
+                )
+                with open(rollout_path, "w") as f:
+                    f.write(r["response_text"])
 
             all_episodes.append((parent, episodes))
 
@@ -289,6 +339,8 @@ def main():
         optimizer.zero_grad()
         total_loss = 0.0
         num_tokens = 0
+        all_ratios = []
+        all_kls = []
 
         for parent, episodes in all_episodes:
             rewards = [ep["reward"] for ep in episodes]
@@ -308,6 +360,7 @@ def main():
                 )
 
                 ratio = torch.exp(new_lp - old_lp)
+                all_ratios.append(ratio.detach().cpu())
                 loss = -(ratio * adv.to(model.device)).mean()
 
                 if KL_PENALTY_COEF > 0:
@@ -316,6 +369,7 @@ def main():
                         temperature=TEMPERATURE,
                     )
                     kl = (new_lp - base_lp).mean()
+                    all_kls.append(kl.item())
                     loss = loss + KL_PENALTY_COEF * kl
 
                 loss.backward()
@@ -333,20 +387,43 @@ def main():
         else:
             print("\n  RL update: skipped (no valid episodes)")
 
-        # -- Save checkpoint -------------------------------------------------
+        # -- Save checkpoint + metrics ---------------------------------------
         sampler.save(step)
         step_time = time.time() - step_start
+
+        # Collect per-step rewards and success rate
+        all_rewards = [ep["reward"] for _, eps in all_episodes for ep in eps]
+        all_bpbs = [ep["result"]["val_bpb"] for _, eps in all_episodes for ep in eps if ep["result"]["success"]]
+        n_success = sum(1 for _, eps in all_episodes for ep in eps if ep["result"]["success"])
+        n_total = sum(len(eps) for _, eps in all_episodes)
+
+        # Ratio stats
+        ratio_stats = {}
+        if all_ratios:
+            cat_ratios = torch.cat(all_ratios)
+            ratio_stats = {
+                "ratio/mean": round(cat_ratios.mean().item(), 4),
+                "ratio/min": round(cat_ratios.min().item(), 4),
+                "ratio/max": round(cat_ratios.max().item(), 4),
+            }
 
         step_info = {
             "step": step,
             "best_bpb": best_bpb,
             "buffer_size": sampler.buffer_size(),
-            "avg_loss": total_loss / max(num_tokens, 1),
+            "avg_loss": round(total_loss / max(num_tokens, 1), 6),
             "num_tokens": num_tokens,
-            "step_time_s": step_time,
+            "step_time_s": round(step_time, 1),
+            "success_rate": f"{n_success}/{n_total}",
+            "rewards": [round(r, 4) for r in all_rewards],
+            "val_bpbs": [round(b, 6) for b in all_bpbs],
+            "avg_gen_time_s": round(sum(step_gen_times) / max(len(step_gen_times), 1), 1),
+            "avg_eval_time_s": round(sum(step_eval_times) / max(len(step_eval_times), 1), 1),
+            "kl_mean": round(sum(all_kls) / max(len(all_kls), 1), 6) if all_kls else None,
+            **ratio_stats,
         }
         step_log.append(step_info)
-        print(f"  Step time: {step_time/60:.1f} min")
+        print(f"  Step time: {step_time/60:.1f} min | Success: {n_success}/{n_total}")
 
         with open(os.path.join(LOG_DIR, "step_log.json"), "w") as f:
             json.dump(step_log, f, indent=2)
@@ -357,17 +434,9 @@ def main():
     print(f"Training complete. Best val_bpb: {best_bpb:.6f}")
     best = sampler.best_state()
     if best:
-        best_code_path = os.path.join(LOG_DIR, "best_train.py")
-        Path(best_code_path).write_text(best.code)
-        print(f"Best code saved to {best_code_path}")
+        Path(os.path.join(LOG_DIR, "best_train.py")).write_text(best.code)
+        print(f"Best code saved to {LOG_DIR}/best_train.py")
     print(f"{'='*60}")
-
-
-def _log_eval_result(result: dict, eval_time: float):
-    if result["success"]:
-        print(f"    eval: val_bpb={result['val_bpb']:.6f} ({eval_time:.1f}s)")
-    else:
-        print(f"    eval: FAILED: {result['output'][:100]} ({eval_time:.1f}s)")
 
 
 if __name__ == "__main__":
