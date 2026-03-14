@@ -33,13 +33,16 @@ echo ""
 # -----------------------------------------------------------
 # 1. Install Ollama (if not present)
 # -----------------------------------------------------------
+export PATH="$HOME/.local/bin:$PATH"
+export LD_LIBRARY_PATH="$HOME/.local/lib/ollama:$LD_LIBRARY_PATH"
+
 if ! command -v ollama &> /dev/null; then
     echo "--- Installing Ollama (no sudo) ---"
-    mkdir -p "$HOME/bin"
-    curl -L https://ollama.com/download/ollama-linux-amd64 -o "$HOME/bin/ollama"
-    chmod +x "$HOME/bin/ollama"
-    export PATH="$HOME/bin:$PATH"
-    echo "Installed to $HOME/bin/ollama"
+    curl -L https://ollama.com/download/ollama-linux-amd64.tgz -o /tmp/ollama.tgz
+    mkdir -p "$HOME/.local"
+    tar -C "$HOME/.local" -xzf /tmp/ollama.tgz
+    rm /tmp/ollama.tgz
+    echo "Installed to $HOME/.local/bin/ollama"
 else
     echo "--- Ollama already installed: $(ollama --version) ---"
 fi
