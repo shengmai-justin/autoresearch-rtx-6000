@@ -22,4 +22,4 @@ fi
 
 # -- Run --
 echo "Starting TTT-Discover training..."
-uv run python train.py
+uv run python train.py "$@"

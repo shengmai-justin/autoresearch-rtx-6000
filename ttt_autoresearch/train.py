@@ -8,6 +8,7 @@ KL penalty → update LoRA weights.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -32,34 +33,31 @@ from model import (
 
 
 # ---------------------------------------------------------------------------
-# Config
+# Config (defaults, overridable via CLI args)
 # ---------------------------------------------------------------------------
 
-MODEL_DIR = "./models/Qwen3.5-27B"
-LLM_GPU = 6
-EVAL_GPUS = [7]  # GPUs for train.py evaluation (add more to parallelize)
-LORA_RANK = 32
-LORA_ALPHA = 64
-
-NUM_STEPS = 50
-GROUP_SIZE = 4          # rollouts per parent
-BATCH_SIZE = 1          # parents per step
-LEARNING_RATE = 4e-5
-KL_PENALTY_COEF = 0.1
-TEMPERATURE = 1.0
-MAX_NEW_TOKENS = 32768
-MAX_GRAD_NORM = 1.0
-
-PUCT_C = 1.0
-PUCT_MAX_BUFFER = 500
-PUCT_TOPK_CHILDREN = 2
-
-REPO_PATH = ".."        # autoresearch repo (parent dir)
-LOG_DIR = "./ttt_log"
-
-# When True, start generating next rollout while current eval runs on another GPU.
-# When False, wait for eval to finish before generating next rollout.
-OVERLAP_GEN_EVAL = True
+def parse_args():
+    p = argparse.ArgumentParser(description="TTT-Discover RL for autoresearch")
+    p.add_argument("--model-dir", default="./models/Qwen3.5-27B")
+    p.add_argument("--llm-gpu", type=int, default=6)
+    p.add_argument("--eval-gpus", type=int, nargs="+", default=[7])
+    p.add_argument("--lora-rank", type=int, default=32)
+    p.add_argument("--lora-alpha", type=int, default=64)
+    p.add_argument("--num-steps", type=int, default=50)
+    p.add_argument("--group-size", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--lr", type=float, default=4e-5)
+    p.add_argument("--kl-coef", type=float, default=0.1)
+    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--max-new-tokens", type=int, default=32768)
+    p.add_argument("--max-grad-norm", type=float, default=1.0)
+    p.add_argument("--puct-c", type=float, default=1.0)
+    p.add_argument("--puct-max-buffer", type=int, default=500)
+    p.add_argument("--puct-topk-children", type=int, default=2)
+    p.add_argument("--repo-path", default="..")
+    p.add_argument("--log-dir", default="./ttt_log")
+    p.add_argument("--no-overlap", action="store_true", help="Disable gen/eval overlap")
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
@@ -170,39 +168,43 @@ def _log_eval_result(result: dict, eval_time: float):
 # ---------------------------------------------------------------------------
 
 def main():
-    os.makedirs(LOG_DIR, exist_ok=True)
-    os.makedirs(os.path.join(LOG_DIR, "rollouts"), exist_ok=True)
+    args = parse_args()
+    overlap = not args.no_overlap
+
+    os.makedirs(args.log_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.log_dir, "rollouts"), exist_ok=True)
     code_dir = os.path.abspath(os.path.dirname(__file__))
-    rollout_log = os.path.join(LOG_DIR, "rollouts.jsonl")
+    rollout_log = os.path.join(args.log_dir, "rollouts.jsonl")
 
     print("=" * 60)
     print("TTT-Discover Autoresearch")
-    print(f"  eval_gpus={EVAL_GPUS}  overlap={OVERLAP_GEN_EVAL}")
+    print(f"  eval_gpus={args.eval_gpus}  overlap={overlap}")
+    print(f"  steps={args.num_steps}  group_size={args.group_size}  batch_size={args.batch_size}")
     print("=" * 60)
 
     # -- Init Ray + eval workers ---------------------------------------------
     ray.init(ignore_reinit_error=True)
     workers = [
-        EvalWorker.remote(gpu, REPO_PATH, i, code_dir)
-        for i, gpu in enumerate(EVAL_GPUS)
+        EvalWorker.remote(gpu, args.repo_path, i, code_dir)
+        for i, gpu in enumerate(args.eval_gpus)
     ]
     print(f"Created {len(workers)} eval workers")
 
     # -- Load model + LoRA ---------------------------------------------------
-    print(f"Loading model from {MODEL_DIR} on GPU {LLM_GPU}...")
+    print(f"Loading model from {args.model_dir} on GPU {args.llm_gpu}...")
     model, tokenizer = load_model(
-        MODEL_DIR, gpu_id=LLM_GPU,
-        lora_rank=LORA_RANK, lora_alpha=LORA_ALPHA,
+        args.model_dir, gpu_id=args.llm_gpu,
+        lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
     )
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=LEARNING_RATE, betas=(0.9, 0.95), eps=1e-8,
+        lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
     )
 
     # -- Baseline run --------------------------------------------------------
     print("Running baseline train.py...")
     from env import run_training
-    baseline_result = run_training(REPO_PATH, gpu_id=EVAL_GPUS[0])
+    baseline_result = run_training(args.repo_path, gpu_id=args.eval_gpus[0])
     if baseline_result.get("crashed"):
         print(f"ERROR: Baseline train.py crashed: {baseline_result.get('error', '')}")
         sys.exit(1)
@@ -210,7 +212,7 @@ def main():
     print(f"Baseline val_bpb: {baseline_bpb:.6f}")
 
     # -- Read original train.py code -----------------------------------------
-    original_code = Path(os.path.join(REPO_PATH, "train.py")).read_text()
+    original_code = Path(os.path.join(args.repo_path, "train.py")).read_text()
 
     # -- Initialize PUCT sampler ---------------------------------------------
     initial_state = State(
@@ -221,23 +223,23 @@ def main():
     )
     sampler = PUCTSampler(
         initial_state=initial_state,
-        log_dir=LOG_DIR,
-        puct_c=PUCT_C,
-        max_buffer=PUCT_MAX_BUFFER,
-        topk_children=PUCT_TOPK_CHILDREN,
+        log_dir=args.log_dir,
+        puct_c=args.puct_c,
+        max_buffer=args.puct_max_buffer,
+        topk_children=args.puct_topk_children,
     )
 
     best_bpb = baseline_bpb
     step_log = []
 
     # -- Main loop -----------------------------------------------------------
-    for step in range(NUM_STEPS):
+    for step in range(args.num_steps):
         step_start = time.time()
         print(f"\n{'='*60}")
-        print(f"Step {step}/{NUM_STEPS} | Best val_bpb: {best_bpb:.6f} | Buffer: {sampler.buffer_size()}")
+        print(f"Step {step}/{args.num_steps} | Best val_bpb: {best_bpb:.6f} | Buffer: {sampler.buffer_size()}")
         print(f"{'='*60}")
 
-        parents = [sampler.sample_state() for _ in range(BATCH_SIZE)]
+        parents = [sampler.sample_state() for _ in range(args.batch_size)]
         all_episodes: list[tuple[State, list[dict]]] = []
         step_gen_times = []
         step_eval_times = []
@@ -249,14 +251,14 @@ def main():
 
             # Generate rollouts + submit evals to Ray workers
             rollouts = []
-            for g in range(GROUP_SIZE):
-                print(f"    Rollout {g+1}/{GROUP_SIZE}...", end=" ", flush=True)
+            for g in range(args.group_size):
+                print(f"    Rollout {g+1}/{args.group_size}...", end=" ", flush=True)
                 gen_start = time.time()
 
                 text, full_ids, old_logprobs, prompt_len = generate_with_logprobs(
                     model, tokenizer, prompt,
-                    max_new_tokens=MAX_NEW_TOKENS,
-                    temperature=TEMPERATURE,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
                 )
                 gen_time = time.time() - gen_start
                 num_new_tokens = len(full_ids) - prompt_len
@@ -275,7 +277,7 @@ def main():
                     "eval_ref": ref,
                     "eval_start": time.time(),
                 })
-                if not OVERLAP_GEN_EVAL:
+                if not overlap:
                     ray.get(ref)
 
             # Collect all eval results
@@ -290,10 +292,9 @@ def main():
                 if result["success"] and result["val_bpb"] < best_bpb:
                     best_bpb = result["val_bpb"]
                     print(f"    *** NEW BEST: {best_bpb:.6f} ***")
-                    # Save best code immediately
                     child = result["child_state"]
                     if child is not None:
-                        Path(os.path.join(LOG_DIR, "best_train.py")).write_text(child.code)
+                        Path(os.path.join(args.log_dir, "best_train.py")).write_text(child.code)
 
                 episodes.append({
                     "full_ids": r["full_ids"],
@@ -303,7 +304,6 @@ def main():
                     "reward": result["reward"],
                 })
 
-                # Log rollout to JSONL
                 _append_jsonl(rollout_log, {
                     "step": step,
                     "parent_id": pi,
@@ -317,9 +317,8 @@ def main():
                     "error": result["output"][:200] if not result["success"] else None,
                 })
 
-                # Save full response for debugging
                 rollout_path = os.path.join(
-                    LOG_DIR, "rollouts", f"step{step:04d}_p{pi}_r{g}.txt"
+                    args.log_dir, "rollouts", f"step{step:04d}_p{pi}_r{g}.txt"
                 )
                 with open(rollout_path, "w") as f:
                     f.write(r["response_text"])
@@ -356,21 +355,21 @@ def main():
 
                 new_lp = compute_response_logprobs(
                     model, tokenizer, full_ids, plen,
-                    temperature=TEMPERATURE,
+                    temperature=args.temperature,
                 )
 
                 ratio = torch.exp(new_lp - old_lp)
                 all_ratios.append(ratio.detach().cpu())
                 loss = -(ratio * adv.to(model.device)).mean()
 
-                if KL_PENALTY_COEF > 0:
+                if args.kl_coef > 0:
                     base_lp = compute_base_logprobs(
                         model, tokenizer, full_ids, plen,
-                        temperature=TEMPERATURE,
+                        temperature=args.temperature,
                     )
                     kl = (new_lp - base_lp).mean()
                     all_kls.append(kl.item())
-                    loss = loss + KL_PENALTY_COEF * kl
+                    loss = loss + args.kl_coef * kl
 
                 loss.backward()
                 total_loss += loss.item() * len(new_lp)
@@ -379,7 +378,7 @@ def main():
         if num_tokens > 0:
             clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad],
-                MAX_GRAD_NORM,
+                args.max_grad_norm,
             )
             optimizer.step()
             avg_loss = total_loss / num_tokens
@@ -391,13 +390,11 @@ def main():
         sampler.save(step)
         step_time = time.time() - step_start
 
-        # Collect per-step rewards and success rate
         all_rewards = [ep["reward"] for _, eps in all_episodes for ep in eps]
         all_bpbs = [ep["result"]["val_bpb"] for _, eps in all_episodes for ep in eps if ep["result"]["success"]]
         n_success = sum(1 for _, eps in all_episodes for ep in eps if ep["result"]["success"])
         n_total = sum(len(eps) for _, eps in all_episodes)
 
-        # Ratio stats
         ratio_stats = {}
         if all_ratios:
             cat_ratios = torch.cat(all_ratios)
@@ -425,7 +422,7 @@ def main():
         step_log.append(step_info)
         print(f"  Step time: {step_time/60:.1f} min | Success: {n_success}/{n_total}")
 
-        with open(os.path.join(LOG_DIR, "step_log.json"), "w") as f:
+        with open(os.path.join(args.log_dir, "step_log.json"), "w") as f:
             json.dump(step_log, f, indent=2)
 
     # -- Done ----------------------------------------------------------------
@@ -434,8 +431,8 @@ def main():
     print(f"Training complete. Best val_bpb: {best_bpb:.6f}")
     best = sampler.best_state()
     if best:
-        Path(os.path.join(LOG_DIR, "best_train.py")).write_text(best.code)
-        print(f"Best code saved to {LOG_DIR}/best_train.py")
+        Path(os.path.join(args.log_dir, "best_train.py")).write_text(best.code)
+        print(f"Best code saved to {args.log_dir}/best_train.py")
     print(f"{'='*60}")
 
 
