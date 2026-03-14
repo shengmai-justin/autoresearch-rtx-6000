@@ -34,8 +34,12 @@ echo ""
 # 1. Install Ollama (if not present)
 # -----------------------------------------------------------
 if ! command -v ollama &> /dev/null; then
-    echo "--- Installing Ollama ---"
-    curl -fsSL https://ollama.com/install.sh | sh
+    echo "--- Installing Ollama (no sudo) ---"
+    mkdir -p "$HOME/bin"
+    curl -L https://ollama.com/download/ollama-linux-amd64 -o "$HOME/bin/ollama"
+    chmod +x "$HOME/bin/ollama"
+    export PATH="$HOME/bin:$PATH"
+    echo "Installed to $HOME/bin/ollama"
 else
     echo "--- Ollama already installed: $(ollama --version) ---"
 fi
