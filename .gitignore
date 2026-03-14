@@ -16,5 +16,17 @@ queue/
 CLAUDE.md
 AGENTS.md
 
+# Ignored directories
+discover/
+rl_pipeline/
+rl-pipeline/
+
+# OS
+.DS_Store
+
+# Logs and model weights
+ttt_autoresearch/ttt_log/
+ttt_autoresearch/models/
+
 # Experimental code/artifacts
 dev/
