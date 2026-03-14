@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -167,6 +168,19 @@ def git_reset(repo_path: str):
     )
     if result.returncode != 0:
         raise RuntimeError(f"git_reset failed: {result.stderr}")
+
+
+# ---------------------------------------------------------------------------
+# Worker repo management (for parallel eval on multiple GPUs)
+# ---------------------------------------------------------------------------
+
+def create_worker_repo(base_repo: str, worker_id: int) -> str:
+    """Create an isolated copy of the repo for a worker. Returns path."""
+    base = os.path.abspath(base_repo)
+    worker_dir = os.path.join(os.path.dirname(base), f"eval_worker_{worker_id}")
+    if not os.path.exists(worker_dir):
+        shutil.copytree(base, worker_dir)
+    return worker_dir
 
 
 # ---------------------------------------------------------------------------

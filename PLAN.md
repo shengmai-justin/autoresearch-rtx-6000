@@ -1,83 +1,88 @@
-# Plan: Autoresearch with PUCT Tree Search (Simplified)
+# Plan: TTT-Discover for Autoresearch
 
 ## Context
 
-We want PUCT tree search to guide an LLM in optimizing train.py (minimizing val_bpb). The original plan used TTT-Discover's full framework (shims, async rollouts, Environment subclasses, etc.) but this was **over-engineered** — we needed ~450 lines of useful code (PUCTSampler + State) but wrote ~900 lines of adapters and shims to use it.
-
-**Rewrite**: Extract just PUCTSampler and State into a standalone file. Write a simple synchronous loop. No shims, no async, no ttt_discover imports.
+Reimplement TTT-Discover's RL approach in `ttt_autoresearch/`, replacing `tinker` (proprietary) with local HuggingFace + PEFT/LoRA. Task: edit train.py to minimize val_bpb.
 
 **Hardware**: 2x RTX PRO 6000 (96GB each). GPU 6 = LLM inference, GPU 7 = train.py evaluation.
-**Mode**: Inference-only. No RL weight updates.
+**Mode**: Full RL — PUCT tree search + entropic advantages + importance sampling + KL penalty + LoRA updates.
 
 ## Status: IMPLEMENTED
 
-Two files created, old files deleted:
-
 | File | Lines | Purpose |
 |---|---|---|
-| `discover/puct.py` | 364 | Self-contained State + PUCTSampler + JSON persistence. Only depends on numpy. |
-| `discover/run_autoresearch.py` | 332 | Prompt building, edit parsing, training runner, model loading, main loop. |
-
-Old files removed:
-- `ttt_discover/local_backend/` (shims.py, completer.py, __init__.py)
-- `ttt_discover/environments/autoresearch/` (env.py, reward.py, __init__.py)
-- `pyproject.toml` restored to original
+| `ttt_autoresearch/puct.py` | 319 | State + PUCTSampler + JSON persistence |
+| `ttt_autoresearch/env.py` | 254 | Prompt building, edit parsing, train.py execution |
+| `ttt_autoresearch/model.py` | 173 | HuggingFace model + LoRA, generation with logprobs |
+| `ttt_autoresearch/train.py` | 322 | Config + main loop with overlap support |
+| `ttt_autoresearch/smoke_test.py` | ~170 | End-to-end pipeline test (mocked model/training) |
+| `ttt_autoresearch/pyproject.toml` | 17 | uv-managed venv (torch, transformers, peft) |
+| `ttt_autoresearch/setup_and_run.sh` | 18 | Download model + install deps + run |
 
 ## Architecture
 
 ```
-for step in range(num_steps):
-    parent = sampler.sample_state()          # PUCT picks best node
-    prompt = build_prompt(repo_path, parent) # train.py + state context
-    response = generate(model, tokenizer, prompt)  # HF model.generate()
-    edits = parse_edits(response)            # regex SEARCH/REPLACE
-    apply_edits(train_py, edits)             # modify file
-    result = run_training(repo_path, gpu)    # subprocess uv run train.py
-    git_reset(repo_path)                     # always reset
-    child = State(value=-val_bpb, ...)       # higher = better for PUCT
-    sampler.update_state(child, parent)      # add to tree
-    sampler.save(step)                       # persist to disk
+for step in range(NUM_STEPS):
+    parent = sampler.sample_state()              # PUCT picks best node
+
+    for g in range(GROUP_SIZE):                  # 4 rollouts per parent
+        text, ids, old_lp = generate(prompt)     # GPU 6: HF generate w/ logprobs
+        write parent.code → train.py             # edits target parent's code
+        apply SEARCH/REPLACE edits
+        result = run_training(repo, gpu=7)       # GPU 7: subprocess uv run train.py
+        git_reset()                              # always reset
+
+    # RL update
+    advantages = entropic_adaptive_beta(rewards) # LOO weights, adaptive beta
+    for each episode:
+        new_lp = forward_pass(ids)               # with gradient
+        ratio = exp(new_lp - old_lp)             # importance sampling
+        loss = -(ratio * advantage).mean()
+        loss += KL_PENALTY * (new_lp - base_lp)  # KL against frozen base
+        loss.backward()
+    optimizer.step()
+    sampler.save(step)
 ```
 
-No async. No shims. No subclasses. One state at a time — no race condition on train.py.
+## Key Design Decisions
 
-## What Was Kept from TTT-Discover
+- **No tinker/chz** — pure PyTorch + PEFT + HuggingFace
+- **No flash-attn** — RTX PRO 6000 is Blackwell (SM 120), uses PyTorch SDPA instead
+- **Ray parallel eval** — `EVAL_GPUS` list configurable, each eval worker gets its own repo copy, round-robin assignment
+- **Overlap gen/eval** — configurable `OVERLAP_GEN_EVAL=True` pipelines generation with evaluation on separate GPUs
+- **Parent code written to train.py** before applying edits (edits are generated against parent's code, not committed code)
+- **GPU memory** — logit tensors freed immediately after extracting logprobs, full_ids moved to CPU
 
-Extracted into `puct.py` (self-contained, no ttt_discover imports):
-- `State` class — concrete (not ABC), with `to_dict`, `from_dict`, `to_prompt`
-- `PUCTSampler` — full PUCT algorithm with visit counts, rank-based prior, exploration bonus
-- JSON persistence — atomic writes, file locking, step-based checkpoints
+## Bug Fixes Applied
 
-## What Was Kept from rl_pipeline/env.py
+1. `evaluate_episode` now writes `parent.code` to train.py before applying edits (SEARCH blocks match parent code, not committed code)
+2. `generate_with_logprobs` frees GPU logit tensors (~19GB) immediately after extraction
+3. `parent.value` check uses `is not None` instead of truthiness
 
-Copied into `run_autoresearch.py`:
-- `parse_edits()` — regex SEARCH/REPLACE extraction with dedup
-- `apply_edits()` — exact match + whitespace-stripped fallback
-- `run_training()` — subprocess with CUDA_VISIBLE_DEVICES, output parsing
-- `git_reset()` — revert train.py to last commit
-- `SYSTEM_PROMPT`, `EDIT_FORMAT` — prompt constants
+## Future Work
 
-## What Was Removed (vs old plan)
+- **Abstract State per task** — Currently `State` is concrete and hardcoded for autoresearch (code = train.py, value = -val_bpb). The original TTT-Discover uses an abstract `State` base class where each task defines its own subclass with a task-specific `construction` field (e.g., number sequences for math, kernel code for CUDA). To support other tasks, make State abstract again with `env_type.create_initial_state()` factory pattern and per-task construction/validation.
+- **Multi-replica LLM inference** — Load model on multiple GPUs for parallel generation. Requires LoRA weight sync across replicas after each RL update.
+- **Checkpoint resume** — Save/load LoRA weights + optimizer state to resume training from a specific step.
 
-- **No tinker/chz shims** — we don't import ttt_discover at all
-- **No importlib bootstrap** — no import chain to work around
-- **No Environment/BaseRewardEvaluator subclasses** — just functions
-- **No DatasetConfig/SingleProblemDataset/ProblemGroupBuilder** — just a for-loop
-- **No async/await or ThreadPoolExecutor** — synchronous
-- **No Qwen3Renderer** — using `tokenizer.apply_chat_template()` directly
-- **No pyproject.toml changes** — ttt_discover is untouched
+## Timing
 
-## Verification (run on server only)
+Per step (sequential): 4 generations (~8 min) + 4 evals (~28 min) + RL update (~1 min) ≈ **37 min/step**
+Per step (overlapped): 1 gen + 3 overlapped gen+eval + 1 eval + RL ≈ **31 min/step**
+50 steps ≈ **26-31 hours**
+
+## Verification (on server)
 
 ```bash
-cd discover
+cd ttt_autoresearch
 
-# 1. Dry run — verify setup without GPU
-python run_autoresearch.py --dry-run
+# 1. Smoke test (no GPU needed, uses tiny-gpt2)
+uv run python smoke_test.py
 
 # 2. Full run
-python run_autoresearch.py
+./setup_and_run.sh
 
-# 3. Full run with custom settings
-python run_autoresearch.py --model-name ./models/Qwen3.5-27B --baseline-bpb 0.95 --num-steps 50
+# 3. Or manually:
+uv sync
+uv run python train.py
 ```

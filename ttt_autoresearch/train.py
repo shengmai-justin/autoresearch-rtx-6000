@@ -2,8 +2,9 @@
 TTT-Discover RL training loop for autoresearch.
 
 Main loop: PUCT selects parent → generate GROUP_SIZE rollouts →
-evaluate each → entropic adaptive beta advantages → importance sampling
-loss + KL penalty → update LoRA weights.
+evaluate in parallel on multiple GPUs via Ray →
+entropic adaptive beta advantages → importance sampling loss +
+KL penalty → update LoRA weights.
 """
 from __future__ import annotations
 
@@ -14,13 +15,14 @@ import sys
 import time
 
 import numpy as np
+import ray
 import torch
 from torch.nn.utils import clip_grad_norm_
 from pathlib import Path
 
 # Local imports (same directory)
 from puct import State, PUCTSampler
-from env import build_prompt, evaluate_episode
+from env import build_prompt, create_worker_repo
 from model import (
     load_model,
     generate_with_logprobs,
@@ -35,7 +37,7 @@ from model import (
 
 MODEL_DIR = "./models/Qwen3.5-27B"
 LLM_GPU = 6
-TRAIN_GPU = 7
+EVAL_GPUS = [7]  # GPUs for train.py evaluation (add more to parallelize)
 LORA_RANK = 32
 LORA_ALPHA = 64
 
@@ -54,6 +56,39 @@ PUCT_TOPK_CHILDREN = 2
 
 REPO_PATH = ".."        # autoresearch repo (parent dir)
 LOG_DIR = "./ttt_log"
+
+# When True, start generating next rollout while current eval runs on another GPU.
+# When False, wait for eval to finish before generating next rollout.
+OVERLAP_GEN_EVAL = True
+
+
+# ---------------------------------------------------------------------------
+# Ray eval worker
+# ---------------------------------------------------------------------------
+
+@ray.remote
+class EvalWorker:
+    """Each worker owns an isolated repo copy and a GPU."""
+
+    def __init__(self, gpu_id: int, base_repo: str, worker_id: int, code_dir: str):
+        import sys as _sys
+        _sys.path.insert(0, code_dir)
+        self.gpu_id = gpu_id
+        from env import create_worker_repo
+        self.repo_path = create_worker_repo(base_repo, worker_id)
+
+    def evaluate(self, parent_dict: dict, response_text: str, step: int) -> dict:
+        from puct import State
+        from env import evaluate_episode
+        parent = State.from_dict(parent_dict)
+        result = evaluate_episode(
+            self.repo_path, parent, response_text,
+            gpu_id=self.gpu_id, step=step,
+        )
+        # Serialize State for Ray transport
+        if result.get("child_state") is not None:
+            result["child_state"] = result["child_state"].to_dict()
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -85,13 +120,12 @@ def compute_entropic_advantages(rewards: list[float]) -> torch.Tensor:
         kl = (q * (logq + logK)).sum()
         return float(kl.item())
 
-    # Find upper bound for binary search
     lo, hi = 0.0, 1.0
     if kl_hat(hi) < delta:
         while hi < beta_max and kl_hat(hi) < delta:
             hi *= 2.0
         if kl_hat(hi) < delta:
-            beta = hi  # best effort
+            beta = hi
         else:
             beta = None
     else:
@@ -106,16 +140,13 @@ def compute_entropic_advantages(rewards: list[float]) -> torch.Tensor:
                 hi = mid
         beta = hi
 
-    # LOO entropic advantages
     e = torch.exp(beta * (r - r.max()))
     if k == 1:
         Z = e
     else:
         Z = (e.sum() - e) / (k - 1)
     w = e / (Z + eps)
-    advantages = w - 1.0
-
-    return advantages
+    return w - 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -124,10 +155,20 @@ def compute_entropic_advantages(rewards: list[float]) -> torch.Tensor:
 
 def main():
     os.makedirs(LOG_DIR, exist_ok=True)
+    code_dir = os.path.abspath(os.path.dirname(__file__))
 
     print("=" * 60)
     print("TTT-Discover Autoresearch")
+    print(f"  eval_gpus={EVAL_GPUS}  overlap={OVERLAP_GEN_EVAL}")
     print("=" * 60)
+
+    # -- Init Ray + eval workers ---------------------------------------------
+    ray.init(ignore_reinit_error=True)
+    workers = [
+        EvalWorker.remote(gpu, REPO_PATH, i, code_dir)
+        for i, gpu in enumerate(EVAL_GPUS)
+    ]
+    print(f"Created {len(workers)} eval workers")
 
     # -- Load model + LoRA ---------------------------------------------------
     print(f"Loading model from {MODEL_DIR} on GPU {LLM_GPU}...")
@@ -143,7 +184,7 @@ def main():
     # -- Baseline run --------------------------------------------------------
     print("Running baseline train.py...")
     from env import run_training
-    baseline_result = run_training(REPO_PATH, gpu_id=TRAIN_GPU)
+    baseline_result = run_training(REPO_PATH, gpu_id=EVAL_GPUS[0])
     if baseline_result.get("crashed"):
         print(f"ERROR: Baseline train.py crashed: {baseline_result.get('error', '')}")
         sys.exit(1)
@@ -178,49 +219,57 @@ def main():
         print(f"Step {step}/{NUM_STEPS} | Best val_bpb: {best_bpb:.6f} | Buffer: {sampler.buffer_size()}")
         print(f"{'='*60}")
 
-        # Select parents via PUCT
         parents = [sampler.sample_state() for _ in range(BATCH_SIZE)]
         all_episodes: list[tuple[State, list[dict]]] = []
 
-        # -- Generate rollouts -----------------------------------------------
         for pi, parent in enumerate(parents):
             print(f"\n  Parent {pi}: val_bpb={-parent.value:.6f}" if parent.value is not None else f"\n  Parent {pi}: no value")
             prompt = build_prompt(parent)
-            episodes = []
+            parent_dict = parent.to_dict()
 
+            # Generate rollouts + submit evals to Ray workers
+            rollouts = []
             for g in range(GROUP_SIZE):
                 print(f"    Rollout {g+1}/{GROUP_SIZE}...", end=" ", flush=True)
                 gen_start = time.time()
 
-                # Generate with logprobs
                 text, full_ids, old_logprobs, prompt_len = generate_with_logprobs(
                     model, tokenizer, prompt,
                     max_new_tokens=MAX_NEW_TOKENS,
                     temperature=TEMPERATURE,
                 )
                 gen_time = time.time() - gen_start
-                print(f"generated ({len(full_ids)-prompt_len} tokens, {gen_time:.1f}s)", end=" ", flush=True)
+                print(f"generated ({len(full_ids)-prompt_len} tokens, {gen_time:.1f}s)", flush=True)
 
-                # Evaluate episode
-                eval_start = time.time()
-                result = evaluate_episode(
-                    REPO_PATH, parent, text,
-                    gpu_id=TRAIN_GPU, step=step,
-                )
-                eval_time = time.time() - eval_start
-
-                if result["success"]:
-                    print(f"val_bpb={result['val_bpb']:.6f} ({eval_time:.1f}s)")
-                    if result["val_bpb"] < best_bpb:
-                        best_bpb = result["val_bpb"]
-                        print(f"    *** NEW BEST: {best_bpb:.6f} ***")
-                else:
-                    print(f"FAILED: {result['output'][:100]} ({eval_time:.1f}s)")
-
-                episodes.append({
+                worker = workers[g % len(workers)]
+                ref = worker.evaluate.remote(parent_dict, text, step)
+                rollouts.append({
                     "full_ids": full_ids,
                     "old_logprobs": old_logprobs,
                     "prompt_len": prompt_len,
+                    "eval_ref": ref,
+                    "eval_start": time.time(),
+                })
+                # Sequential mode: block until this eval finishes
+                if not OVERLAP_GEN_EVAL:
+                    ray.get(ref)
+
+            # Collect all eval results
+            episodes = []
+            for r in rollouts:
+                result = ray.get(r["eval_ref"])
+                eval_time = time.time() - r["eval_start"]
+                # Deserialize child state
+                if result.get("child_state") is not None:
+                    result["child_state"] = State.from_dict(result["child_state"])
+                _log_eval_result(result, eval_time)
+                if result["success"] and result["val_bpb"] < best_bpb:
+                    best_bpb = result["val_bpb"]
+                    print(f"    *** NEW BEST: {best_bpb:.6f} ***")
+                episodes.append({
+                    "full_ids": r["full_ids"],
+                    "old_logprobs": r["old_logprobs"],
+                    "prompt_len": r["prompt_len"],
                     "result": result,
                     "reward": result["reward"],
                 })
@@ -253,17 +302,14 @@ def main():
                 old_lp = ep["old_logprobs"].to(model.device)
                 plen = ep["prompt_len"]
 
-                # New logprobs (with gradient)
                 new_lp = compute_response_logprobs(
                     model, tokenizer, full_ids, plen,
                     temperature=TEMPERATURE,
                 )
 
-                # Importance sampling loss
                 ratio = torch.exp(new_lp - old_lp)
                 loss = -(ratio * adv.to(model.device)).mean()
 
-                # KL penalty against base model
                 if KL_PENALTY_COEF > 0:
                     base_lp = compute_base_logprobs(
                         model, tokenizer, full_ids, plen,
@@ -276,7 +322,6 @@ def main():
                 total_loss += loss.item() * len(new_lp)
                 num_tokens += len(new_lp)
 
-        # Gradient step
         if num_tokens > 0:
             clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad],
@@ -303,11 +348,11 @@ def main():
         step_log.append(step_info)
         print(f"  Step time: {step_time/60:.1f} min")
 
-        # Save step log
         with open(os.path.join(LOG_DIR, "step_log.json"), "w") as f:
             json.dump(step_log, f, indent=2)
 
     # -- Done ----------------------------------------------------------------
+    ray.shutdown()
     print(f"\n{'='*60}")
     print(f"Training complete. Best val_bpb: {best_bpb:.6f}")
     best = sampler.best_state()
@@ -316,6 +361,13 @@ def main():
         Path(best_code_path).write_text(best.code)
         print(f"Best code saved to {best_code_path}")
     print(f"{'='*60}")
+
+
+def _log_eval_result(result: dict, eval_time: float):
+    if result["success"]:
+        print(f"    eval: val_bpb={result['val_bpb']:.6f} ({eval_time:.1f}s)")
+    else:
+        print(f"    eval: FAILED: {result['output'][:100]} ({eval_time:.1f}s)")
 
 
 if __name__ == "__main__":
