@@ -6,8 +6,8 @@ No YAML, no CLI args for now — just change the values and run.
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-MODEL_NAME = "Qwen/Qwen3.5-9B"                         # HuggingFace model ID
-MODEL_DIR = "./models/Qwen3.5-9B"                       # local path after download
+MODEL_NAME = "Qwen/Qwen3.5-27B"                        # HuggingFace model ID
+MODEL_DIR = "./models/Qwen3.5-27B"                      # local path after download
 VLLM_PORT = 8000                                        # vLLM server port
 VLLM_GPU = 6                                            # GPU index for LLM
 
@@ -23,7 +23,7 @@ EVAL_TIME_BUDGET = 300                                  # seconds per train.py r
 # ---------------------------------------------------------------------------
 MAX_NEW_TOKENS = 32768          # max tokens the model can generate per response
                                 # (reasoning model — <think> tokens count against this budget)
-MAX_CONTEXT = 262144            # Qwen3.5-9B native context length
+MAX_CONTEXT = 131072            # Qwen3.5-27B native context length
 TEMPERATURE = 1.0               # sampling temperature during episode collection
 BASELINE_BPB = 1.0              # initial val_bpb (updated after first baseline run)
 CRASH_PENALTY = -1.0            # reward for crashed runs
