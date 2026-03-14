@@ -31,7 +31,7 @@ def load_model(
         model_dir,
         torch_dtype=torch.bfloat16,
         device_map=device,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     )
 
     lora_config = LoraConfig(
