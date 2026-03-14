@@ -72,16 +72,6 @@ appear, including indentation. Do NOT add or remove leading spaces.
 =======
 (replacement lines)
 >>>>>>> REPLACE
-
-Example (note: indentation must match the file exactly):
-
-<<<<<<< SEARCH
-DEPTH = 8
-ASPECT_RATIO = 64
-=======
-DEPTH = 12
-ASPECT_RATIO = 64
->>>>>>> REPLACE
 """
 
 
